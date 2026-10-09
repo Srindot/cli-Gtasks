@@ -13,7 +13,17 @@ import (
 // testHook lets tests read the view from inside the event loop.
 var testHook func(m *Model, msg any) bool
 
-func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *Model) Update(msg tea.Msg) (tm tea.Model, cmd tea.Cmd) {
+	defer func() {
+		if tm == nil {
+			tm = m
+		}
+	}()
+	defer m.guard("update")
+	return m.update(msg)
+}
+
+func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if testHook != nil && testHook(m, msg) {
 		return m, nil
 	}

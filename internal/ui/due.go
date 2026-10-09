@@ -39,6 +39,9 @@ func ParseDue(s string) (time.Time, bool) {
 	}
 	if strings.HasPrefix(s, "+") {
 		n, unit := s[1:], "d"
+		if n == "" {
+			return time.Time{}, false
+		}
 		if l := n[len(n)-1:]; l == "d" || l == "w" || l == "m" || l == "y" {
 			n, unit = n[:len(n)-1], l
 		}
@@ -140,4 +143,20 @@ func ago(ts string) string {
 		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
 	}
 	return t.Local().Format("Jan 2 2006")
+}
+
+// relDays phrases the distance to d: "today", "in 3 days", "2 days ago".
+func relDays(d time.Time) string {
+	n := int(d.Sub(today()).Hours() / 24)
+	switch {
+	case n == 0:
+		return "today"
+	case n == 1:
+		return "tomorrow"
+	case n == -1:
+		return "yesterday"
+	case n > 1:
+		return fmt.Sprintf("in %d days", n)
+	}
+	return fmt.Sprintf("%d days ago", -n)
 }

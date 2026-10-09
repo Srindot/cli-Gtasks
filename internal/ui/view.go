@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -16,6 +15,8 @@ func spin(now time.Time) string {
 	i := int(now.UnixMilli()/80) % len(spinner)
 	return paint(gradient(shimmer, float64(now.UnixMilli())/1800), spinner[i])
 }
+
+func ansiTrunc(s string, w int) string { return ansi.Truncate(s, max(w, 0), "…") }
 
 // fit truncates or pads s to exactly w cells.
 func fit(s string, w int) string {
@@ -29,22 +30,70 @@ func fit(s string, w int) string {
 	return s
 }
 
+// line builds one row of a column. When bg is set, every segment (and the
+// padding) carries it, so the highlight spans the full width like yazi's.
+type line struct {
+	bg string
+	sb strings.Builder
+	w  int
+}
+
+func (l *line) put(s string, st lipgloss.Style) {
+	if s == "" {
+		return
+	}
+	if l.bg != "" {
+		st = st.Background(lipgloss.Color(l.bg))
+	}
+	l.sb.WriteString(st.Render(s))
+	l.w += lipgloss.Width(s)
+}
+
+func (l *line) raw(s string) {
+	l.sb.WriteString(s)
+	l.w += lipgloss.Width(s)
+}
+
+func (l *line) done(w int) string {
+	if l.w < w {
+		l.put(strings.Repeat(" ", w-l.w), lipgloss.NewStyle())
+	}
+	return ansi.Truncate(l.sb.String(), w, "")
+}
+
+// ---- layout --------------------------------------------------------------
+
+// layout splits the width 2:4:3 like yazi's parent/current/preview columns.
 func (m *Model) layout() (lw, tw, dw int) {
 	switch {
-	case m.w >= 120:
-		lw, dw = 28, max(34, min(52, m.w*28/100))
-	case m.w >= 72:
-		lw = 26
-	case m.focus == paneLists:
-		lw = m.w
+	case m.w >= 96:
+		u := m.w - 2
+		lw = max(18, u*2/9)
+		dw = max(30, u*3/9)
+		tw = u - lw - dw
+	case m.w >= 64:
+		lw = 20
+		tw = m.w - lw - 1
+		if m.focus == paneDetails {
+			dw, tw = tw, 0
+		}
+	default:
+		switch m.focus {
+		case paneLists:
+			lw = m.w
+		case paneDetails:
+			dw = m.w
+		default:
+			tw = m.w
+		}
 	}
-	return lw, m.w - lw - dw, dw
+	return
 }
 
 func (m *Model) showDetails() bool { _, _, dw := m.layout(); return dw > 0 }
 
-// bodyHeight is the number of content lines inside a pane.
-func (m *Model) bodyHeight() int { return max(m.h-5, 1) }
+// bodyHeight is the number of rows in the columns.
+func (m *Model) bodyHeight() int { return max(m.h-3, 1) }
 
 func (m *Model) sepIndex(rs []row) int {
 	if m.filter != "" {
@@ -73,86 +122,101 @@ func (m *Model) lineCount() int {
 	return len(rs)
 }
 
-func (m *Model) focusColor(p pane, now time.Time) string {
+// selBg is the highlight behind the hovered row; it brightens as a pane gains focus.
+func (m *Model) selBg(p pane, now time.Time) string {
 	t := easeOut(float64(now.Sub(m.focusAt)) / float64(focusLife))
 	if m.focus == p {
-		return lerp(cHlHigh, cIris, t)
+		return lerp(cHlLow, cHlMed, t)
 	}
-	return lerp(cIris, cHlHigh, t)
+	return lerp(cHlMed, cHlLow, t)
 }
 
-// box draws a rounded panel with a title in the top border and an optional
-// scrollbar thumb on the right edge.
-func box(title string, lines []string, w, h int, border string, total, offset int) string {
-	if w < 4 || h < 2 {
-		return strings.Repeat(strings.Repeat(" ", max(w, 0))+"\n", max(h-1, 0)) + strings.Repeat(" ", max(w, 0))
+// cascade fades + slides rows in one after another after a list switch.
+func cascade(s string, i int, since time.Duration, w int) string {
+	p := clamp(float64(since-time.Duration(min(i, 24))*16*time.Millisecond) / float64(200*time.Millisecond))
+	if p >= 1 {
+		return s
 	}
-	b := fg(border)
-	inner := w - 4
-	title = ansi.Truncate(title, max(w-6, 0), "…")
-	fill := w - 4 - lipgloss.Width(title) - 1
-	var sb strings.Builder
-	sb.WriteString(b.Render("╭─ ") + title + b.Render(" "+strings.Repeat("─", max(fill, 0))+"╮"))
-	body := h - 2
-	thumbA, thumbB := -1, -1
-	if total > body && body > 0 {
-		size := max(1, body*body/total)
-		thumbA = offset * (body - size) / max(total-body, 1)
-		thumbB = thumbA + size
-	}
-	for i := 0; i < body; i++ {
-		l := ""
-		if i < len(lines) {
-			l = lines[i]
-		}
-		right := b.Render("│")
-		if i >= thumbA && i < thumbB {
-			right = paint(lerp(border, cSubtle, .5), "┃")
-		}
-		sb.WriteString("\n" + b.Render("│") + " " + fit(l, inner) + " " + right)
-	}
-	sb.WriteString("\n" + b.Render("╰"+strings.Repeat("─", w-2)+"╯"))
-	return sb.String()
+	shift := int((1 - easeOut(p)) * 6)
+	plain := ansi.Strip(s)
+	return fit(strings.Repeat(" ", shift)+paint(lerp(cHlMed, cSubtle, p), plain), w)
 }
 
-func (m *Model) View() string {
+// View always returns exactly m.h lines of exactly m.w cells. Anything taller
+// makes the terminal scroll and the top of the UI vanishes, so clamp here no
+// matter what the panes produced.
+func (m *Model) View() (out string) {
 	if m.w == 0 || m.h == 0 {
 		return ""
 	}
+	s := func() (s string) {
+		defer m.guard("view")
+		return m.render()
+	}()
+	ls := strings.Split(s, "\n")
+	if len(ls) > m.h {
+		ls = ls[:m.h]
+	}
+	for len(ls) < m.h {
+		ls = append(ls, "")
+	}
+	for i, l := range ls {
+		ls[i] = fit(l, m.w)
+	}
+	return strings.Join(ls, "\n")
+}
+
+func (m *Model) render() string {
 	now := time.Now()
 	if len(m.lists) == 0 {
 		return m.splash(now)
 	}
-	var body string
-	ph := max(m.h-3, 2)
+	h := m.bodyHeight()
+	var body []string
 	if m.mode == modeHelp {
-		body = lipgloss.Place(m.w, ph, lipgloss.Center, lipgloss.Center, m.help())
+		body = strings.Split(lipgloss.Place(m.w, h, lipgloss.Center, lipgloss.Center, m.help()), "\n")
 	} else {
 		lw, tw, dw := m.layout()
-		var cols []string
+		var cols [][]string
 		if lw > 0 {
-			cols = append(cols, m.viewLists(lw, ph, now))
+			cols = append(cols, m.colLists(lw, h, now))
 		}
 		if tw > 0 {
-			cols = append(cols, m.viewTasks(tw, ph, now))
+			cols = append(cols, m.colTasks(tw, h, now))
 		}
 		if dw > 0 {
-			cols = append(cols, m.viewDetails(dw, ph, now))
+			cols = append(cols, m.colDetails(dw, h, now))
 		}
-		body = lipgloss.JoinHorizontal(lipgloss.Top, cols...)
+		sep := paint(cHlMed, "│")
+		for i := 0; i < h; i++ {
+			parts := make([]string, len(cols))
+			for c := range cols {
+				parts[c] = cols[c][i]
+			}
+			body = append(body, strings.Join(parts, sep))
+		}
 	}
-	return fit(m.header(now), m.w) + "\n" + body + "\n" + fit(m.statusLine(), m.w) + "\n" + fit(m.cmdLine(now), m.w)
+	return fit(m.header(now), m.w) + "\n" + strings.Join(body, "\n") + "\n" + fit(m.statusLine(), m.w) + "\n" + fit(m.cmdLine(now), m.w)
 }
 
 func (m *Model) busy() bool { return m.pending+m.fetching > 0 }
 
+// header: logo, then a yazi-like breadcrumb, then sync state on the right.
 func (m *Model) header(now time.Time) string {
 	logo := " ✿ gtask"
-	var left string
+	phase := 0.0
 	if m.busy() || now.Sub(m.started) < introLife {
-		left = wave(logo, now.Sub(m.started).Seconds()*.9, .09, true)
-	} else {
-		left = wave(logo, 0, .09, true)
+		phase = now.Sub(m.started).Seconds() * .9
+	}
+	left := wave(logo, phase, .09, true)
+	if l := m.curList(); l != nil {
+		left += paint(cHlHigh, "  ") + fg(cIris).Bold(true).Render(l.Title)
+		if t := m.selected(); t != nil && m.focus != paneLists {
+			if r := m.rootOf(t); r != t {
+				left += paint(cHlHigh, " / ") + paint(cSubtle, ansiTrunc(r.Title, 28))
+			}
+			left += paint(cHlHigh, " / ") + paint(cText, ansiTrunc(t.Title, 40))
+		}
 	}
 	var right string
 	switch {
@@ -161,15 +225,16 @@ func (m *Model) header(now time.Time) string {
 	case m.busy():
 		right = spin(now) + paint(cFoam, " syncing")
 	case m.offline:
-		right = paint(cLove, "✗ offline")
+		right = paint(cLove, ic.off+" offline")
 	case !m.lastSync.IsZero():
-		right = paint(cPine, "●") + paint(cMuted, " synced "+ago(m.lastSync.UTC().Format(time.RFC3339)))
+		right = paint(cPine, ic.ok) + paint(cMuted, " synced "+ago(m.lastSync.UTC().Format(time.RFC3339)))
 	}
 	if m.demo {
 		right = paint(cGold, "demo") + paint(cHlHigh, " · ") + right
 	}
-	gap := m.w - lipgloss.Width(left) - lipgloss.Width(right) - 1
-	return left + strings.Repeat(" ", max(gap, 1)) + right
+	right += " "
+	left = ansiTrunc(left, m.w-lipgloss.Width(right)-1)
+	return left + strings.Repeat(" ", max(m.w-lipgloss.Width(left)-lipgloss.Width(right), 1)) + right
 }
 
 func plural(n int) string {
@@ -179,306 +244,496 @@ func plural(n int) string {
 	return "s"
 }
 
-func (m *Model) viewLists(w, h int, now time.Time) string {
-	inner := w - 4
-	var lines []string
+// ---- lists column --------------------------------------------------------
+
+func (m *Model) colLists(w, h int, now time.Time) []string {
+	lines := make([]string, 0, h)
 	for i, l := range m.lists {
 		sel := i == m.listIdx
-		bar := "  "
+		ln := &line{}
 		if sel {
-			c := cIris
-			if m.focus != paneLists {
-				c = cHlHigh
-			}
-			bar = paint(c, "▌") + " "
+			ln.bg = m.selBg(paneLists, now)
 		}
-		name := paint(cSubtle, l.Title)
+		icon, iconC, name := ic.list, cMuted, fg(cSubtle)
 		if sel {
-			name = fg(cRose).Bold(true).Render(l.Title)
+			icon, iconC, name = ic.listOpen, cIris, fg(cText).Bold(true)
 		}
 		count := ""
 		if open, _ := m.counts(l.ID); m.loaded[l.ID] && open > 0 {
-			count = paint(cMuted, fmt.Sprint(open))
-		} else if !m.loaded[l.ID] {
-			count = paint(cHlHigh, "·")
+			count = fmt.Sprint(open)
 		}
-		name = ansi.Truncate(name, inner-2-lipgloss.Width(count)-1, "…")
-		gap := inner - 2 - lipgloss.Width(name) - lipgloss.Width(count)
-		lines = append(lines, bar+name+strings.Repeat(" ", max(gap, 1))+count)
+		ln.put(" "+icon+" ", fg(iconC))
+		ln.put(ansiTrunc(l.Title, w-6-len(count)), name)
+		ln.put(strings.Repeat(" ", max(w-ln.w-len(count)-1, 1)), lipgloss.NewStyle())
+		ln.put(count+" ", fg(cMuted))
+		lines = append(lines, ln.done(w))
 	}
-	border := m.focusColor(paneLists, now)
-	return box(paint(cSubtle, "lists"), lines, w, h, border, 0, 0)
+	for len(lines) < h {
+		lines = append(lines, strings.Repeat(" ", w))
+	}
+	lines = lines[:h]
+	if m.pop != nil && m.pop.pane == paneLists {
+		m.overlayPopup(lines, w, m.listIdx+1, now)
+	}
+	return lines
 }
 
-func (m *Model) viewTasks(w, h int, now time.Time) string {
-	inner := w - 4
+// ---- tasks column --------------------------------------------------------
+
+func (m *Model) colTasks(w, h int, now time.Time) []string {
 	rs := m.rows()
 	sep := m.sepIndex(rs)
-	var lines []string
+	var all []string
 	for i, r := range rs {
 		if i == sep {
-			label := fmt.Sprintf(" completed · %d ", len(rs)-sep)
-			lines = append(lines, paint(cHlMed, "──")+paint(cMuted, label)+paint(cHlMed, strings.Repeat("─", max(inner-2-lipgloss.Width(label), 0))))
+			label := fmt.Sprintf(" %s completed · %d ", ic.done, len(rs)-sep)
+			all = append(all, " "+paint(cHlMed, "─")+paint(cMuted, label)+paint(cHlMed, strings.Repeat("─", max(w-2-lipgloss.Width(label), 0))))
 		}
-		lines = append(lines, m.row(r, i == m.cursor, inner, now))
+		all = append(all, m.taskRow(r, i == m.cursor, w, now))
 	}
-	body := h - 2
-	if len(lines) == 0 {
-		var msg []string
-		switch {
-		case !m.loaded[m.curID()]:
-			msg = []string{spin(now) + paint(cSubtle, " loading")}
-		case m.filter != "":
-			msg = []string{paint(cMuted, "no matches for “"+m.filter+"”")}
-		default:
-			_, done := m.counts(m.curID())
-			msg = []string{wave("✿  all clear", now.Sub(m.started).Seconds()*.3, .08, false), "",
-				paint(cMuted, "press ") + paint(cRose, "o") + paint(cMuted, " to add a task")}
-			if done > 0 && !m.showDone {
-				msg = append(msg, paint(cMuted, fmt.Sprintf("%d completed hidden · ", done))+paint(cRose, "C")+paint(cMuted, " to show"))
-			}
-		}
-		top := max((body-len(msg))/2, 0)
-		lines = make([]string, top)
-		for _, l := range msg {
-			lines = append(lines, strings.Repeat(" ", max((inner-lipgloss.Width(l))/2, 0))+l)
+	if len(all) == 0 {
+		all = m.emptyTasks(w, h, now)
+	}
+	lines := make([]string, 0, h)
+	since := now.Sub(m.listAt)
+	for i := m.offset; i < len(all) && len(lines) < h; i++ {
+		lines = append(lines, cascade(all[i], i-m.offset, since, w))
+	}
+	for len(lines) < h {
+		lines = append(lines, strings.Repeat(" ", w))
+	}
+	// Scrollbar thumb on the right edge when the list overflows.
+	if total := len(all); total > h {
+		size := max(1, h*h/total)
+		top := m.offset * (h - size) / max(total-h, 1)
+		for i := top; i < top+size && i < h; i++ {
+			lines[i] = ansi.Truncate(lines[i], w-1, "") + paint(cHlHigh, "▐")
 		}
 	}
-	end := min(m.offset+body, len(lines))
-	if m.offset < end {
-		lines = lines[m.offset:end]
+	if m.pop != nil && m.pop.pane == paneTasks {
+		m.overlayPopup(lines, w, m.lineOf(m.cursor)-m.offset+1, now)
 	}
-
-	l := m.curList()
-	title := ""
-	if l != nil {
-		// The title types itself in when you switch lists.
-		p := easeOut(float64(now.Sub(m.listAt)) / float64(focusLife))
-		n := int(p * float64(utf8.RuneCountInString(l.Title)))
-		shown := string([]rune(l.Title)[:n])
-		if p >= 1 {
-			title = fg(cRose).Bold(true).Render(l.Title)
-		} else {
-			title = wave(shown, now.Sub(m.listAt).Seconds()*3, .1, true)
-		}
-		open, done := m.counts(l.ID)
-		title += paint(cMuted, fmt.Sprintf(" %d", open))
-		if done > 0 {
-			title += paint(cHlHigh, fmt.Sprintf(" ✓%d", done))
-		}
-		if m.filter != "" {
-			title += paint(cGold, "  /"+m.filter)
-		}
-	}
-	return box(title, lines, w, h, m.focusColor(paneTasks, now), m.lineCount(), m.offset)
+	return lines
 }
 
-func (m *Model) row(r row, sel bool, w int, now time.Time) string {
-	focused := m.focus == paneTasks
-	bar := "  "
+func (m *Model) emptyTasks(w, h int, now time.Time) []string {
+	var msg []string
 	switch {
-	case sel && focused:
-		bar = paint(cIris, "▌") + " "
-	case sel:
-		bar = paint(cHlHigh, "▌") + " "
-	case r.t != nil:
-		// A short comet tail where the cursor just was.
-		if at, ok := m.trail[r.t.ID]; ok && focused {
-			p := clamp(float64(now.Sub(at)) / float64(trailLife))
-			g := []string{"▌", "▍", "▎", "▏"}[min(int(p*4), 3)]
-			bar = paint(lerp(cIris, cHlMed, p), g) + " "
+	case !m.loaded[m.curID()]:
+		msg = []string{spin(now) + paint(cSubtle, " loading")}
+	case m.filter != "":
+		msg = []string{paint(cMuted, "no matches for “"+m.filter+"”")}
+	default:
+		_, done := m.counts(m.curID())
+		msg = []string{wave("✿  all clear", now.Sub(m.started).Seconds()*.3, .08, false), "",
+			paint(cRose, "a") + paint(cMuted, "  new task")}
+		if done > 0 && !m.showDone {
+			msg = append(msg, paint(cRose, "C")+paint(cMuted, fmt.Sprintf("  show %d completed", done)))
 		}
 	}
-	indent := strings.Repeat(paint(cHlMed, "│ "), r.depth)
+	out := make([]string, max((h-len(msg))/2-1, 0))
+	for _, l := range msg {
+		out = append(out, strings.Repeat(" ", max((w-lipgloss.Width(l))/2, 0))+l)
+	}
+	for i := range out {
+		out[i] = fit(out[i], w)
+	}
+	return out
+}
+
+func (m *Model) taskRow(r row, sel bool, w int, now time.Time) string {
+	focused := m.focus == paneTasks
+	ln := &line{}
+	if sel && !r.editNew {
+		ln.bg = m.selBg(paneTasks, now)
+	}
+
+	// Left accent: solid on the cursor, a fading comet tail where it just was.
+	switch {
+	case sel && focused:
+		ln.put("▎", fg(cIris))
+	case r.t != nil && m.trail[r.t.ID] != (time.Time{}) && focused:
+		p := clamp(float64(now.Sub(m.trail[r.t.ID])) / float64(trailLife))
+		ln.put([]string{"▎", "▏", "▏", " "}[min(int(p*4), 3)], fg(lerp(cIris, cHlLow, p)))
+	default:
+		ln.put(" ", lipgloss.NewStyle())
+	}
+	ln.put(" ", lipgloss.NewStyle())
+	if r.depth > 0 {
+		branch := "├─ "
+		if r.last {
+			branch = "╰─ "
+		}
+		ln.put(strings.Repeat("   ", r.depth-1)+" "+branch, fg(cHlHigh))
+	}
+
 	if r.editNew {
-		return bar + indent + paint(cRose, "○ ") + m.in.View()
+		ln.put(ic.open+" ", fg(cRose))
+		ln.raw(m.in.View())
+		return ln.done(w)
 	}
 	t := r.t
 	a := m.anims[t.ID]
 
-	check, checkC := "○", cSubtle
+	check, checkC := ic.open, cSubtle
+	if r.depth > 0 {
+		checkC = cMuted
+	}
 	if sel && focused {
 		checkC = cRose
 	}
 	if t.Done() {
-		check, checkC = "✓", cPine
+		check, checkC = ic.done, cPine
 	}
 
+	if m.mode == modeInsert && m.ed.kind == editRename && m.ed.taskID == t.ID {
+		ln.bg = ""
+		ln.put(check+" ", fg(cRose))
+		ln.raw(m.in.View())
+		return ln.done(w)
+	}
+
+	// Right side: due date (or completion time), notes + folded markers.
 	meta, metaC := "", cMuted
 	if t.Done() {
 		meta = ago(t.Completed)
 	} else if d, ok := t.DueDate(); ok {
 		meta, metaC = HumanDue(d)
+		meta = ic.due + " " + meta
 	}
-	extras := ""
+	var extras []string
 	if r.folded {
-		extras += paint(cMuted, fmt.Sprintf(" ▸ %d", r.kids))
+		extras = append(extras, fmt.Sprintf("+%d", r.kids))
 	}
-	if t.Notes != "" && !m.showDetails() {
-		extras += paint(cMuted, " ≡")
+	if t.Notes != "" {
+		extras = append(extras, ic.notes)
 	}
-
-	if m.mode == modeInsert && m.ed.kind == editRename && m.ed.taskID == t.ID {
-		return bar + indent + paint(cRose, check+" ") + m.in.View()
+	extra := ""
+	if len(extras) > 0 {
+		extra = " " + strings.Join(extras, " ")
 	}
 
 	title := t.Title
 	if title == "" {
 		title = "(untitled)"
 	}
-	left := bar + indent
-	used := lipgloss.Width(left) + 2 + lipgloss.Width(extras) + lipgloss.Width(meta) + 2
-	title = ansi.Truncate(title, max(w-used, 4), "…")
+	avail := w - ln.w - 2 - lipgloss.Width(extra) - lipgloss.Width(meta) - 2
+	title = ansiTrunc(title, max(avail, 4))
 	runes := []rune(title)
 
 	base := fg(cText)
-	if t.Done() {
+	switch {
+	case t.Done():
 		base = fg(cMuted).Strikethrough(true)
-	} else if r.depth > 0 && !sel {
-		base = fg(lerp(cText, cSubtle, .5))
+	case r.depth > 0 && !sel:
+		base = fg(lerp(cText, cSubtle, .6))
 	}
 	if sel && focused {
 		base = base.Bold(true)
 	}
-	styled := m.highlight(title, base)
+
+	segs := m.highlight(title, base)
 
 	if a != nil {
 		p := a.progress(now)
 		switch a.kind {
 		case animComplete:
-			// Checkbox fills in, then a strikethrough sweeps left to right.
+			// The ring fills, then a strikethrough sweeps across, then a sparkle.
 			frames := []string{"○", "◔", "◑", "◕", "●"}
 			if p < .45 {
 				check, checkC = frames[min(int(p/.45*5), 4)], lerp(cSubtle, cFoam, p/.45)
 			} else {
-				check, checkC = "✓", lerp(cFoam, cPine, (p-.45)/.55)
+				check, checkC = ic.done, lerp(cFoam, cPine, (p-.45)/.55)
 			}
 			k := int(easeInOut((p-.15)/.7) * float64(len(runes)))
-			mc := lerp(cText, cMuted, p)
-			styled = fg(mc).Strikethrough(true).Render(string(runes[:k])) + base.Render(string(runes[k:]))
-			sparkle := []string{"✦", "✧", "⋆", "·", " "}
+			segs = []segment{
+				{string(runes[:k]), fg(lerp(cText, cMuted, p)).Strikethrough(true)},
+				{string(runes[k:]), base},
+			}
 			if p > .4 {
-				meta, metaC = sparkle[min(int((p-.4)/.6*5), 4)], lerp(cGold, cRose, p)
+				meta, metaC = []string{"✦", "✧", "⋆", "·", " "}[min(int((p-.4)/.6*5), 4)], lerp(cGold, cRose, p)
 			}
 		case animDelete:
 			e := easeInOut(p)
 			k := int((1 - e) * float64(len(runes)))
-			styled = fg(lerp(cText, cLove, p*2)).Render(string(runes[:k]))
-			check, checkC = "✕", lerp(cLove, cHlMed, e)
-			meta = ""
-			if sel {
-				bar = paint(cLove, "▌") + " "
-			}
+			segs = []segment{{string(runes[:k]), fg(lerp(cText, cLove, p*2))}}
+			check, checkC, meta = ic.trash, lerp(cLove, cHlMed, e), ""
 		case animFlash:
 			c := lerp(cGold, cText, easeOut(p))
 			if t.Done() {
 				c = lerp(cGold, cMuted, easeOut(p))
 			}
-			styled = fg(c).Bold(p < .5).Render(title)
+			segs = []segment{{title, fg(c).Bold(p < .5)}}
 		}
 	}
 
-	left += paint(checkC, check) + " "
-	gap := w - lipgloss.Width(left) - lipgloss.Width(styled) - lipgloss.Width(extras) - lipgloss.Width(meta)
-	return left + styled + extras + strings.Repeat(" ", max(gap, 1)) + paint(metaC, meta)
+	ln.put(check+" ", fg(checkC))
+	for _, s := range segs {
+		ln.put(s.s, s.st)
+	}
+	ln.put(extra, fg(cMuted))
+	ln.put(strings.Repeat(" ", max(w-ln.w-lipgloss.Width(meta)-1, 1)), lipgloss.NewStyle())
+	ln.put(meta+" ", fg(metaC))
+	return ln.done(w)
 }
 
-// highlight renders the filter match inside s.
-func (m *Model) highlight(s string, base lipgloss.Style) string {
+type segment struct {
+	s  string
+	st lipgloss.Style
+}
+
+// highlight splits s around the filter match so it can be underlined.
+func (m *Model) highlight(s string, base lipgloss.Style) []segment {
 	if m.filter == "" {
-		return base.Render(s)
+		return []segment{{s, base}}
 	}
 	i := strings.Index(strings.ToLower(s), strings.ToLower(m.filter))
 	if i < 0 || len(strings.ToLower(s)) != len(s) {
-		return base.Render(s)
+		return []segment{{s, base}}
 	}
 	j := i + len(m.filter)
-	return base.Render(s[:i]) + fg(cGold).Bold(true).Underline(true).Render(s[i:j]) + base.Render(s[j:])
+	return []segment{{s[:i], base}, {s[i:j], fg(cGold).Bold(true).Underline(true)}, {s[j:], base}}
 }
+
+// ---- details column ------------------------------------------------------
 
 func wrap(s string, w int) []string {
 	if s == "" {
 		return nil
 	}
-	return strings.Split(lipgloss.NewStyle().Width(w).Render(s), "\n")
+	var out []string
+	for _, l := range strings.Split(lipgloss.NewStyle().Width(w).Render(s), "\n") {
+		out = append(out, strings.TrimRight(l, " "))
+	}
+	return out
 }
 
-func (m *Model) viewDetails(w, h int, now time.Time) string {
-	inner := w - 4
+func (m *Model) colDetails(w, h int, now time.Time) []string {
 	t := m.selected()
+	focused := m.focus == paneDetails
+	inner := w - 4
 	var lines []string
-	if t != nil {
+	popupAt := 0
+
+	// field renders a group of lines as one focusable item.
+	field := func(id int, ls ...func(l *line)) {
+		for _, f := range ls {
+			ln := &line{}
+			on := focused && m.dfield == id
+			if on {
+				ln.bg = m.selBg(paneDetails, now)
+				ln.put("▎", fg(cIris))
+				popupAt = len(lines) + 1
+			} else {
+				ln.put(" ", lipgloss.NewStyle())
+			}
+			ln.put(" ", lipgloss.NewStyle())
+			f(ln)
+			lines = append(lines, ln.done(w))
+		}
+	}
+	blank := func() { lines = append(lines, strings.Repeat(" ", w)) }
+	heading := func(name, extra string) {
+		ln := &line{}
+		ln.put("  "+name, fg(cIris).Bold(true))
+		ln.put(extra, fg(cMuted))
+		ln.put(" "+strings.Repeat("─", max(w-ln.w-3, 0)), fg(cHlMed))
+		lines = append(lines, ln.done(w))
+	}
+	label := func(l *line, icon, k string) { l.put(icon+" ", fg(cMuted)); l.put(fmt.Sprintf("%-8s", k), fg(cMuted)) }
+
+	if t == nil {
+		blank()
+		for _, l := range []string{paint(cMuted, "nothing selected")} {
+			lines = append(lines, "  "+l)
+		}
+	} else {
+		blank()
+		if r := m.rootOf(t); r != t {
+			lines = append(lines, (&line{}).doneWith(w, func(l *line) {
+				l.put("  "+ic.sub+" ", fg(cMuted))
+				l.put(ansiTrunc(r.Title, inner-3), fg(cMuted))
+			}))
+		}
+		// Title
 		ts := fg(cText).Bold(true)
 		if t.Done() {
 			ts = fg(cMuted).Strikethrough(true)
 		}
-		for _, l := range wrap(t.Title, inner) {
-			lines = append(lines, ts.Render(strings.TrimRight(l, " ")))
+		var tl []func(l *line)
+		for _, s := range wrap(t.Title, inner) {
+			s := s
+			tl = append(tl, func(l *line) { l.put(s, ts) })
 		}
-		lines = append(lines, "")
-		field := func(k, v string) { lines = append(lines, paint(cMuted, fmt.Sprintf("%-9s", k))+v) }
-		if d, ok := t.DueDate(); ok {
-			hd, c := HumanDue(d)
-			field("due", paint(c, hd)+paint(cMuted, "  "+d.Format("Mon, Jan 2")))
-		} else {
-			field("due", paint(cHlHigh, "—"))
-		}
-		if t.Done() {
-			field("status", paint(cPine, "✓ done ")+paint(cMuted, ago(t.Completed)))
-		} else {
-			field("status", paint(cSubtle, "○ open"))
-		}
-		if n := len(m.children(m.curID(), t.ID)); n > 0 {
-			field("subtasks", paint(cIris, fmt.Sprint(n)))
-		}
+		field(fTitle, tl...)
+		blank()
+
+		// Due
+		field(fDue, func(l *line) {
+			label(l, ic.due, "due")
+			if d, ok := t.DueDate(); ok {
+				_, c := HumanDue(d)
+				l.put(d.Format("Mon, Jan 2"), fg(c))
+				l.put("  "+relDays(d), fg(cMuted))
+			} else {
+				l.put("none", fg(cHlHigh))
+				if focused && m.dfield == fDue {
+					l.put("  ⏎ to set", fg(cMuted))
+				}
+			}
+		})
+		// Status
+		field(fStatus, func(l *line) {
+			label(l, ic.ok, "status")
+			if t.Done() {
+				l.put(ic.done+" done", fg(cPine))
+				l.put("  "+ago(t.Completed), fg(cMuted))
+			} else {
+				l.put(ic.open+" open", fg(cSubtle))
+			}
+		})
 		if u := ago(t.Updated); u != "" {
-			field("updated", paint(cSubtle, u))
+			field(-1, func(l *line) { label(l, ic.sync, "updated"); l.put(u, fg(cSubtle)) })
 		}
-		lines = append(lines, "", paint(cIris, "notes"))
-		if t.Notes == "" {
-			lines = append(lines, paint(cHlHigh, "none — ")+paint(cMuted, "e")+paint(cHlHigh, " to write some"))
+		blank()
+
+		// Notes
+		heading(ic.notes+" notes", "")
+		if m.mode == modeNotes {
+			for _, s := range strings.Split(m.ta.View(), "\n") {
+				lines = append(lines, "  "+fit(s, w-2))
+			}
+			lines = append(lines, "  "+paint(cMuted, "esc save · ^c cancel"))
+		} else if t.Notes == "" {
+			field(fNotes, func(l *line) { l.put("empty — ⏎ to write", fg(cHlHigh)) })
 		} else {
-			for _, l := range wrap(t.Notes, inner) {
-				lines = append(lines, paint(cSubtle, l))
+			var nl []func(l *line)
+			for _, s := range wrap(t.Notes, inner) {
+				s := s
+				nl = append(nl, func(l *line) { l.put(s, fg(cSubtle)) })
+			}
+			field(fNotes, nl...)
+		}
+		blank()
+
+		// Subtasks
+		subs := m.detailSubs()
+		done := 0
+		for _, s := range subs {
+			if s.Done() {
+				done++
 			}
 		}
+		if t.Parent == "" {
+			heading(ic.sub+" subtasks", fmt.Sprintf("  %d/%d", done, len(subs)))
+			if len(subs) > 0 {
+				// A tiny progress bar.
+				bw := max(inner-2, 4)
+				fill := bw * done / len(subs)
+				lines = append(lines, "  "+paint(cPine, strings.Repeat("━", fill))+paint(cHlMed, strings.Repeat("━", bw-fill)))
+			}
+			for i, s := range subs {
+				s := s
+				field(fSubs+i, func(l *line) {
+					if s.Done() {
+						l.put(ic.done+" ", fg(cPine))
+						l.put(ansiTrunc(s.Title, inner-2), fg(cMuted).Strikethrough(true))
+					} else {
+						l.put(ic.open+" ", fg(cSubtle))
+						l.put(ansiTrunc(s.Title, inner-2), fg(cText))
+					}
+				})
+			}
+			lines = append(lines, "  "+paint(cMuted, "A")+paint(cHlHigh, "  add subtask"))
+		}
 	}
-	return box(paint(cSubtle, "details"), lines, w, h, cHlHigh, 0, 0)
+
+	// Fade the preview in when the selection changes.
+	since := now.Sub(m.selAt)
+	if since < 160*time.Millisecond && m.mode != modeNotes {
+		p := easeOut(float64(since) / float64(160*time.Millisecond))
+		for i := range lines {
+			lines[i] = fit(paint(lerp(cHlMed, cSubtle, p), ansi.Strip(lines[i])), w)
+		}
+	}
+	for i := range lines {
+		lines[i] = fit(lines[i], w)
+	}
+	for len(lines) < h {
+		lines = append(lines, strings.Repeat(" ", w))
+	}
+	lines = lines[:h]
+	if m.pop != nil && m.pop.pane == paneDetails {
+		m.overlayPopup(lines, w, popupAt, now)
+	}
+	return lines
 }
 
+func (l *line) doneWith(w int, f func(l *line)) string { f(l); return l.done(w) }
+
+// ---- status + command line -----------------------------------------------
+
 var modeInfo = map[mode][2]string{
-	modeNormal:  {"NORMAL", cIris},
-	modeInsert:  {"INSERT", cFoam},
-	modeCommand: {"COMMAND", cGold},
-	modeSearch:  {"SEARCH", cRose},
-	modePrompt:  {"INPUT", cGold},
+	modeNormal:  {"NOR", cIris},
+	modeInsert:  {"INS", cFoam},
+	modeCommand: {"CMD", cGold},
+	modeSearch:  {"FIND", cRose},
+	modePopup:   {"INPUT", cRose},
 	modeConfirm: {"CONFIRM", cLove},
+	modeNotes:   {"NOTES", cFoam},
 	modeHelp:    {"HELP", cPine},
 }
 
 func (m *Model) statusLine() string {
 	mi := modeInfo[m.mode]
-	pill := lipgloss.NewStyle().Background(lipgloss.Color(mi[1])).Foreground(lipgloss.Color(cBase)).Bold(true).Padding(0, 1).Render(mi[0])
-	left := pill
+	c := mi[1]
+	if m.mode == modePopup && m.pop != nil {
+		c = m.pop.color
+	}
+	on := func(fgc, bgc string) lipgloss.Style {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(fgc)).Background(lipgloss.Color(bgc))
+	}
+	pill := on(cBase, c).Bold(true).Render(" " + mi[0] + " ")
+	left := paint(c, ic.capL) + pill
 	if l := m.curList(); l != nil {
 		open, done := m.counts(l.ID)
-		left += " " + paint(cRose, l.Title) + paint(cMuted, fmt.Sprintf("  %d open · %d done", open, done))
+		left += on(c, cHlMed).Render(ic.capR) + on(cText, cHlMed).Render(" "+l.Title+" ") + paint(cHlMed, ic.capR) +
+			paint(cMuted, fmt.Sprintf(" %d open · %d done", open, done))
+	} else {
+		left += paint(c, ic.capR)
 	}
 	if m.pending > 0 {
 		left += paint(cGold, fmt.Sprintf("  ↑%d", m.pending))
 	}
-	var right []string
-	if sc := m.showcmd(); sc != "" {
-		right = append(right, paint(cGold, sc))
+	if m.filter != "" {
+		left += paint(cRose, "  /"+m.filter)
 	}
-	if m.focus == paneTasks {
-		if n := len(m.rows()); n > 0 {
-			right = append(right, paint(cSubtle, fmt.Sprintf("%d/%d", m.cursor+1, n)))
+
+	var right string
+	if sc := m.showcmd(); sc != "" {
+		right += paint(cGold, sc) + "  "
+	}
+	right += paint(cMuted, "? help  ")
+	n := len(m.rows())
+	pos := "0/0"
+	pct := "All"
+	if n > 0 {
+		pos = fmt.Sprintf("%d/%d", m.cursor+1, n)
+		h := m.bodyHeight()
+		switch total := m.lineCount(); {
+		case total <= h:
+			pct = "All"
+		case m.offset == 0:
+			pct = "Top"
+		case m.offset >= total-h:
+			pct = "Bot"
+		default:
+			pct = fmt.Sprintf("%d%%", m.offset*100/max(total-h, 1))
 		}
 	}
-	right = append(right, paint(cMuted, "? help "))
-	r := strings.Join(right, paint(cHlHigh, "  "))
-	return left + strings.Repeat(" ", max(m.w-lipgloss.Width(left)-lipgloss.Width(r), 1)) + r
+	right += paint(cHlMed, ic.capL) + on(cText, cHlMed).Render(" "+pos+" ") + on(c, cHlMed).Render(ic.capL) +
+		on(cBase, c).Bold(true).Render(" "+pct+" ") + paint(c, ic.capR)
+	return left + strings.Repeat(" ", max(m.w-lipgloss.Width(left)-lipgloss.Width(right), 1)) + right
 }
 
 func (m *Model) showcmd() string {
@@ -495,12 +750,14 @@ func (m *Model) cmdLine(now time.Time) string {
 		return paint(cGold, ":") + m.in.View()
 	case modeSearch:
 		return paint(cRose, "/") + m.in.View()
-	case modePrompt:
-		return paint(cIris, m.promptLabel) + m.in.View()
-	case modeConfirm:
-		return paint(cGold, m.confirmText)
 	case modeInsert:
 		return fg(cFoam).Bold(true).Render("-- INSERT --") + paint(cMuted, "   ⏎ save & next   esc save   ^c cancel")
+	case modePopup:
+		hint := "⏎ confirm   esc cancel"
+		if m.pop != nil && m.pop.tab != nil {
+			hint += "   tab task ⇄ subtask"
+		}
+		return paint(cMuted, hint)
 	}
 	if m.quit {
 		return spin(now) + paint(cGold, fmt.Sprintf(" waiting for %d change%s to reach Google… ", m.pending, plural(m.pending))) + paint(cMuted, "(q again to force)")
@@ -513,10 +770,12 @@ func (m *Model) cmdLine(now time.Time) string {
 		if fade := age - (toastLife - toastFade); fade > 0 {
 			c = lerp(t.color, cHlMed, float64(fade)/float64(toastFade))
 		}
-		return paint(c, string(runes[:n]))
+		return " " + paint(c, string(runes[:n]))
 	}
 	return ""
 }
+
+// ---- splash + help -------------------------------------------------------
 
 var logoArt = []string{
 	"╔═╗╔╦╗╔═╗╔═╗╦╔═",
@@ -530,7 +789,6 @@ func (m *Model) splash(now time.Time) string {
 	for i, l := range logoArt {
 		out = append(out, wave(l, t*.7-float64(i)*.06, .035, true))
 	}
-	// A row of twinkling stars.
 	stars := []rune(" ·⋆✧✦✧⋆· ")
 	var tw strings.Builder
 	for i := 0; i < 15; i++ {
@@ -541,11 +799,11 @@ func (m *Model) splash(now time.Time) string {
 	out = append(out, "", tw.String(), "")
 	if m.offline {
 		out = append(out, paint(cLove, "couldn't reach Google Tasks"), paint(cMuted, "R retry · q quit"))
+		if m.toast != nil {
+			out = append(out, "", paint(cMuted, ansiTrunc(m.toast.text, m.w-4)))
+		}
 	} else {
 		out = append(out, spin(now)+paint(cSubtle, " fetching your lists"))
-	}
-	if m.toast != nil && m.offline {
-		out = append(out, "", paint(cMuted, ansi.Truncate(m.toast.text, m.w-4, "…")))
 	}
 	return lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Center, lipgloss.JoinVertical(lipgloss.Center, out...))
 }
@@ -553,14 +811,14 @@ func (m *Model) splash(now time.Time) string {
 func (m *Model) help() string {
 	type kv [2]string
 	sections := []struct {
-		name  string
-		color string
-		keys  []kv
+		name, color string
+		keys        []kv
 	}{
-		{"move", cFoam, []kv{{"j k", "down / up (5j works)"}, {"gg G", "top / bottom"}, {"^d ^u", "half page"}, {"h l  tab", "lists ↔ tasks"}, {"H L  gT gt", "prev / next list"}}},
-		{"edit", cIris, []kv{{"o O", "new task below / above"}, {"i a r", "rename"}, {"cc S", "replace title"}, {"e ⏎", "title + notes in $EDITOR"}, {"t T", "set / clear due date"}, {"x ␣", "toggle done"}}},
-		{"organize", cRose, []kv{{"dd", "delete (into register)"}, {"yy", "yank (+ clipboard)"}, {"p P", "paste below / above"}, {"J K", "move down / up"}, {">> <<", "indent / outdent"}, {"za zR zM", "fold / open / close all"}, {"u", "undo"}}},
-		{"more", cGold, []kv{{"/", "filter   esc clears"}, {"C", "show completed"}, {"R", "sync now"}, {":new :rename", "create / rename list"}, {":dellist :clear", "delete list / clear done"}, {"q :q", "quit"}}},
+		{"move", cFoam, []kv{{"j k", "down / up (5j works)"}, {"gg G", "top / bottom"}, {"^d ^u", "half page"}, {"h l", "lists ← tasks → details"}, {"tab", "cycle panes"}, {"H L  gT gt", "prev / next list"}}},
+		{"create", cRose, []kv{{"a", "new task"}, {"A", "new subtask"}, {"tab", "(in popup) task ⇄ subtask"}, {"o O", "inline below / above, ⏎ keeps going"}, {"…@tom", "due date while typing"}}},
+		{"edit", cIris, []kv{{"x ␣", "toggle done"}, {"r  i  S", "rename / inline / replace"}, {"t T", "set / clear due date"}, {"N", "edit notes inline"}, {"e", "title + notes in $EDITOR"}, {"l ⏎", "details: edit any field"}}},
+		{"organize", cGold, []kv{{"dd D", "delete"}, {"yy p P", "yank / paste (moves across lists)"}, {"J K", "move down / up"}, {">> <<", "make / unmake subtask"}, {"za zR zM", "fold"}, {"u", "undo"}}},
+		{"lists", cPine, []kv{{"a r dd", "new / rename / delete (lists pane)"}, {"/  esc", "filter / clear"}, {"C  R", "show completed / sync"}, {":q", "quit"}}},
 	}
 	col := func(idx ...int) string {
 		var ls []string
@@ -568,17 +826,21 @@ func (m *Model) help() string {
 			s := sections[i]
 			ls = append(ls, fg(s.color).Bold(true).Render(s.name))
 			for _, k := range s.keys {
-				ls = append(ls, paint(cText, fmt.Sprintf("%-16s", k[0]))+paint(cSubtle, k[1]))
+				ls = append(ls, paint(cText, fmt.Sprintf("%-12s", k[0]))+paint(cSubtle, k[1]))
 			}
 			ls = append(ls, "")
 		}
 		return strings.Join(ls, "\n")
 	}
-	cols := lipgloss.JoinHorizontal(lipgloss.Top, col(0, 1), "    ", col(2, 3))
-	due := paint(cMuted, "dates: ") + paint(cSubtle, "today tom fri +3d +2w oct 12 2026-10-12") +
-		paint(cMuted, "   quick add: ") + paint(cSubtle, "buy milk @tom")
-	content := lipgloss.JoinVertical(lipgloss.Left, cols, due)
+	content := lipgloss.JoinHorizontal(lipgloss.Top, col(0, 1, 4), "    ", col(2, 3))
+	lines := strings.Split(strings.TrimRight(content, "\n "), "\n")
 	w := min(lipgloss.Width(content)+4, m.w)
-	lines := strings.Split(content, "\n")
-	return box(wave("keys", 0, .1, true), lines, w, min(len(lines)+2, m.h-3), cIris, 0, 0)
+	b := fg(cIris)
+	title := wave(" keys ", 0, .1, true)
+	out := []string{b.Render("╭─") + title + b.Render(strings.Repeat("─", max(w-3-lipgloss.Width(title), 0))+"╮")}
+	for _, l := range lines {
+		out = append(out, b.Render("│")+" "+fit(l, w-4)+" "+b.Render("│"))
+	}
+	out = append(out, b.Render("╰"+strings.Repeat("─", max(w-2, 0))+"╯"))
+	return strings.Join(out, "\n")
 }

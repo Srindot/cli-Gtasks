@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -50,7 +51,8 @@ const usage = `gtask — Google Tasks in your terminal
 usage
   gtask                       open the TUI
   gtask --demo                try the TUI with sample data (no account needed)
-  gtask auth                  connect your Google account
+  gtask setup                 guided one-time Google setup (start here)
+  gtask auth                  sign in again (after setup)
   gtask ls [list]             print open tasks
   gtask lists                 print your task lists
   gtask add [-l list] text    add a task  (end with @tomorrow, @fri, @+3d … for a due date)
@@ -73,6 +75,9 @@ func main() {
 		cmd, args = args[0], args[1:]
 	}
 	switch cmd {
+	case "setup", "init":
+		must(setup())
+		return
 	case "auth", "login":
 		must(login())
 		return
@@ -87,6 +92,16 @@ func main() {
 	}
 
 	be, err := backend()
+	if errors.Is(err, gtasks.ErrNoCredentials) && cmd == "" && isTTY() {
+		fmt.Println(rose.Render("✿ ") + text.Render("gtask isn't connected to Google yet."))
+		if (asker{bufio.NewReader(os.Stdin)}).yes(text.Render("  set it up now?")) {
+			must(setup())
+			be, err = backend()
+		} else {
+			fmt.Println(muted.Render("  later: ") + rose.Render("gtask setup") + muted.Render(" · look around: ") + rose.Render("gtask --demo"))
+			os.Exit(0)
+		}
+	}
 	if err != nil {
 		explain(err)
 		os.Exit(1)
@@ -144,10 +159,14 @@ func login() error {
 		explain(err)
 		os.Exit(1)
 	}
-	fmt.Println(rose.Render("✿ ") + text.Render("opening your browser to sign in to Google…"))
+	fmt.Println()
+	fmt.Println(rose.Render("  ✿ ") + text.Render("opening your browser to sign in to Google…"))
+	fmt.Println(muted.Render("    Google will say ") + gold.Render("“Google hasn't verified this app”") + muted.Render(" — that's expected, it's your own app:"))
+	fmt.Println(muted.Render("    click ") + text.Render("Advanced") + muted.Render(" → ") + text.Render("Go to gtask (unsafe)") + muted.Render(" → ") + text.Render("Continue"))
 	err := gtasks.Login(context.Background(), configDir, func(url string) {
 		openBrowser(url)
-		fmt.Println(muted.Render("  if nothing opened, visit:\n  ") + subtle.Render(url))
+		fmt.Println(muted.Render("    if nothing opened, visit:"))
+		fmt.Println("    " + subtle.Render(url))
 	})
 	if err != nil {
 		return err
@@ -159,16 +178,8 @@ func login() error {
 func explain(err error) {
 	switch {
 	case errors.Is(err, gtasks.ErrNoCredentials):
-		step := func(n, s string) string { return iris.Render("  "+n+" ") + text.Render(s) }
-		fmt.Println(rose.Render("✿ gtask needs a Google OAuth client (one-time, ~3 minutes)") + "\n")
-		fmt.Println(step("1", "open ") + foam.Render("https://console.cloud.google.com/projectcreate") + text.Render(" and create a project"))
-		fmt.Println(step("2", "enable the Tasks API: ") + foam.Render("https://console.cloud.google.com/apis/library/tasks.googleapis.com"))
-		fmt.Println(step("3", "Google Auth Platform → Branding: fill in an app name + your email"))
-		fmt.Println(step("4", "Audience: External, then add yourself as a test user ") + muted.Render("(or Publish the app so tokens don't expire after 7 days)"))
-		fmt.Println(step("5", "Clients → Create client → ") + gold.Render("Desktop app") + text.Render(" → download the JSON"))
-		fmt.Println(step("6", "save it as ") + gold.Render(gtasks.CredentialsPath(configDir)))
-		fmt.Println(step("7", "run ") + rose.Render("gtask auth"))
-		fmt.Println("\n" + muted.Render("  want a look first? ") + rose.Render("gtask --demo"))
+		fmt.Println(rose.Render("✿ ") + text.Render("gtask isn't connected to Google yet."))
+		fmt.Println(muted.Render("  run ") + rose.Render("gtask setup") + muted.Render(" (guided, ~3 min) or try ") + rose.Render("gtask --demo"))
 	case errors.Is(err, gtasks.ErrNoToken):
 		fmt.Println(rose.Render("✿ ") + text.Render("not signed in yet — run ") + rose.Render("gtask auth"))
 	default:

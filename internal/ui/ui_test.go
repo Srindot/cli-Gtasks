@@ -8,6 +8,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/srindot/gtask/internal/gtasks"
 )
@@ -35,6 +36,8 @@ func start(t *testing.T, w, h int) *harness {
 // settle waits for animations and sync to finish.
 func (h *harness) settle() { time.Sleep(900 * time.Millisecond) }
 
+var keyDelay = 15 * time.Millisecond
+
 func (h *harness) keys(ks ...string) {
 	for _, k := range ks {
 		var msg tea.KeyMsg
@@ -51,7 +54,7 @@ func (h *harness) keys(ks ...string) {
 			msg = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
 		}
 		h.p.Send(msg)
-		time.Sleep(15 * time.Millisecond)
+		time.Sleep(keyDelay)
 	}
 }
 
@@ -64,7 +67,17 @@ func (h *harness) typ(s string) {
 func (h *harness) view(label string) string {
 	v := make(chan string)
 	h.p.Send(viewReq(v))
-	s := <-v
+	var s string
+	select {
+	case s = <-v:
+	case <-time.After(3 * time.Second):
+		h.t.Fatalf("%s: program stopped responding (panic?)", label)
+	}
+	for i, l := range strings.Split(s, "\n") {
+		if w := lipgloss.Width(l); w != h.m.w {
+			h.t.Errorf("%s: line %d is %d wide, want %d: %q", label, i, w, h.m.w, l)
+		}
+	}
 	if os.Getenv("SHOW") != "" {
 		h.t.Logf("── %s ──\n%s", label, s)
 	}
@@ -163,6 +176,7 @@ func TestFlow(t *testing.T) {
 	h.keys("t")
 	h.p.Send(tea.KeyMsg{Type: tea.KeyCtrlU})
 	h.typ("+2d")
+	h.view("due popup")
 	h.keys("enter")
 	h.settle()
 	if ts, _ := h.d.Tasks(t0(), "inbox"); ts[1].Title != "renamed!" || ts[1].Due != gtasks.FormatDue(today().AddDate(0, 0, 2)) {
@@ -220,6 +234,10 @@ func TestNarrow(t *testing.T) {
 }
 
 func TestParseDue(t *testing.T) {
+	for _, s := range []string{"+", "+d", "@", ""} {
+		ParseDue(s) // partial input from the live preview must not panic
+		SplitQuickDue("x @" + s)
+	}
 	for _, s := range []string{"today", "tom", "fri", "+3d", "+2w", "oct 12", "2026-10-12", "12", "10/12", "next mon"} {
 		if d, ok := ParseDue(s); !ok || d.IsZero() {
 			t.Errorf("ParseDue(%q) failed", s)
@@ -230,5 +248,78 @@ func TestParseDue(t *testing.T) {
 	}
 	if title, _, ok := SplitQuickDue("buy milk @tom"); !ok || title != "buy milk" {
 		t.Errorf("quick due: %q %v", title, ok)
+	}
+}
+
+func TestCreateAndDetails(t *testing.T) {
+	h := start(t, 140, 30)
+	// a: new top-level task after the cursor, with a quick due date.
+	h.keys("a")
+	h.typ("Pay rent @fri")
+	h.view("popup new task")
+	h.keys("enter")
+	h.settle()
+	ts, _ := h.d.Tasks(t0(), "inbox")
+	if ts[1].Title != "Pay rent" || ts[1].Due == "" || ts[1].Parent != "" {
+		t.Fatalf("a did not create a dated top-level task: %+v", ts[1])
+	}
+
+	// A: subtask under the selected task.
+	h.keys("A")
+	h.typ("Set up autopay")
+	h.view("popup new subtask")
+	h.keys("enter")
+	h.settle()
+	ts, _ = h.d.Tasks(t0(), "inbox")
+	if ts[2].Title != "Set up autopay" || ts[2].Parent != ts[1].ID {
+		t.Fatalf("A did not create a subtask: %+v", ts[2])
+	}
+
+	// a then tab flips the popup to subtask mode (anchor is now the subtask → same parent).
+	h.keys("a")
+	h.keys("tab")
+	h.typ("Email landlord")
+	h.view("popup toggled to subtask")
+	h.keys("enter")
+	h.settle()
+	ts, _ = h.d.Tasks(t0(), "inbox")
+	if ts[3].Title != "Email landlord" || ts[3].Parent != ts[1].ID {
+		t.Fatalf("tab toggle failed: %+v", ts[3])
+	}
+
+	// Details pane: l focuses it, j to the due field, enter edits it.
+	h.keys("g", "g", "j", "l")
+	h.view("details focused")
+	h.keys("j", "enter")
+	h.p.Send(tea.KeyMsg{Type: tea.KeyCtrlU})
+	h.typ("+3d")
+	h.view("due popup in details")
+	h.keys("enter")
+	h.settle()
+	ts, _ = h.d.Tasks(t0(), "inbox")
+	if ts[1].Due != gtasks.FormatDue(today().AddDate(0, 0, 3)) {
+		t.Fatalf("due edit from details failed: %+v", ts[1])
+	}
+
+	// Notes inline editor.
+	h.keys("j", "j", "enter")
+	h.typ("first line")
+	h.p.Send(tea.KeyMsg{Type: tea.KeyEnter})
+	h.typ("second line")
+	h.view("editing notes")
+	h.keys("esc")
+	h.settle()
+	ts, _ = h.d.Tasks(t0(), "inbox")
+	if ts[1].Notes != "first line\nsecond line" {
+		t.Fatalf("notes not saved: %q", ts[1].Notes)
+	}
+
+	// Subtask rows in details can be toggled with x.
+	h.keys("j", "x")
+	h.settle()
+	h.view("details after toggling subtask")
+	ts, _ = h.d.Tasks(t0(), "inbox")
+	if !ts[2].Done() {
+		t.Fatalf("subtask not toggled from details: %+v", ts[2])
 	}
 }

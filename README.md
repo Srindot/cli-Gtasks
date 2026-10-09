@@ -4,7 +4,7 @@ Google Tasks in your terminal: quick, Rosé Pine colors, transparent background,
 
 ```
 gtask --demo     # try it with sample data, no account needed
-gtask auth       # connect Google (one-time setup below)
+gtask setup      # connect Google: guided, one time
 gtask            # open the TUI
 gtask ls [list]  # print open tasks
 gtask add -l work "ship it @fri"
@@ -16,32 +16,46 @@ gtask add -l work "ship it @fri"
 - **Transparent:** only foreground colors are used, so your terminal background shows through.
 - **Animated:** completing a task fills the checkbox and sweeps a strikethrough across it. Deleted rows fade out in red. The cursor leaves a short trail. List titles type themselves in. The logo shimmers while syncing. Messages slide in and fade out. When nothing is moving, the app uses no CPU.
 
+## Layout
+
+The layout follows yazi, with three columns: **lists** on the left, **tasks and subtasks** in the middle, **details** on the right (deadline, status, notes, subtasks). Use `h`/`l` to move between them.
+
 ## Keys (press `?` in the app)
 
 | | |
 |---|---|
 | `j k` `gg G` `^d ^u` `5j` | move |
-| `h l` `tab` | switch between the lists and tasks panes |
+| `h l` · `tab` | lists ← tasks → details · cycle panes |
 | `H L` / `gT gt` | previous / next list |
-| `o O` | new task below / above (Enter adds another, Esc finishes) |
-| `i a r` · `cc S` | rename · replace the title |
-| `e` / `⏎` | edit the title and notes in `$EDITOR` |
+| **`a`** | new task (input box; `tab` switches to subtask) |
+| **`A`** | new subtask of the selected task |
+| `o O` | type a new task inline below / above (Enter keeps adding) |
 | `x` / `space` | mark done / not done |
-| `t` · `T` | set / clear the due date (`tom`, `fri`, `+3d`, `oct 12`, …) |
-| `dd` `yy` `p P` | delete / yank / paste (works across lists, so `dd` then `p` moves a task) |
-| `J K` · `>> <<` | move down / up · indent / outdent |
+| `r` · `i` · `S` | rename (input box) · rename inline · replace the title |
+| `t` · `T` | set the deadline (with a live preview) · clear it |
+| `N` · `e` | edit notes inline · edit the title and notes in `$EDITOR` |
+| `l` then `j/k` `⏎` | edit any field in the details pane (title, deadline, status, notes, subtasks) |
+| `dd` `yy` `p P` | delete / yank / paste (works across lists) |
+| `J K` · `>> <<` | move down / up · make / unmake a subtask |
 | `za zR zM` | fold |
 | `u` | undo |
 | `/` · `C` · `R` | filter · show completed · sync now |
-| `:new` `:rename` `:dellist` `:clear` `:q` | list commands |
+| lists pane: `a` `r` `dd` | new / rename / delete a list |
+
+Icons come from a Nerd Font. Set `GTASK_ICONS=0` for plain unicode instead.
 
 Quick add: end a title with `@tomorrow`, `@fri`, or `@+2w` to set a due date.
 
 ## One-time Google setup
 
-1. Create a project at https://console.cloud.google.com/projectcreate
-2. Enable the **Tasks API**: https://console.cloud.google.com/apis/library/tasks.googleapis.com
-3. In **Google Auth Platform**, open **Branding** and enter an app name and your email. Then open **Audience**, choose External, and add yourself as a test user.
-   *If you leave the app in "Testing", tokens expire every 7 days. Click **Publish app** to avoid that. Google's "unverified app" warning is fine for personal use.*
-4. Go to **Clients**, create a client of type **Desktop app**, and download the JSON.
-5. Save it as `~/.config/gtask/credentials.json`, then run `gtask auth`.
+Run `gtask setup`. It walks through five short steps and opens the exact console page for each one, so you never have to find your way around the Cloud console:
+
+1. **Create a project.** Any name works.
+2. **Enable the Tasks API.**
+3. **Set up the sign-in screen.** Click Get started, choose External, and enter your email.
+4. **Publish the app.** If you skip this, Google signs you out every 7 days.
+5. **Create a Desktop app client.** Then paste its Client ID and secret into the terminal.
+
+Then it signs you in. When Google says *"Google hasn't verified this app"*, click **Advanced → Go to gtask (unsafe)**. That's expected, because the app is your own.
+
+If you already downloaded a `client_secret_*.json`, `setup` finds it in `~/Downloads` and skips straight to sign-in.
