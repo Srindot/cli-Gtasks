@@ -17,8 +17,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/srindot/gtask/internal/gtasks"
-	"github.com/srindot/gtask/internal/ui"
+	"github.com/Srindot/cli-Gtasks/internal/gtasks"
+	"github.com/Srindot/cli-Gtasks/internal/ui"
 )
 
 var (
@@ -102,6 +102,14 @@ func main() {
 			os.Exit(0)
 		}
 	}
+	if (errors.Is(err, gtasks.ErrExpired) || errors.Is(err, gtasks.ErrNoToken)) && isTTY() {
+		// Apps left in "Testing" lose their sign-in every 7 days; just redo it.
+		if errors.Is(err, gtasks.ErrExpired) {
+			fmt.Println(rose.Render("✿ ") + text.Render("your Google sign-in expired ") + muted.Render("(normal for apps in Testing, about weekly)"))
+		}
+		must(login())
+		be, err = backend()
+	}
 	if err != nil {
 		explain(err)
 		os.Exit(1)
@@ -180,6 +188,8 @@ func explain(err error) {
 	case errors.Is(err, gtasks.ErrNoCredentials):
 		fmt.Println(rose.Render("✿ ") + text.Render("gtask isn't connected to Google yet."))
 		fmt.Println(muted.Render("  run ") + rose.Render("gtask setup") + muted.Render(" (guided, ~3 min) or try ") + rose.Render("gtask --demo"))
+	case errors.Is(err, gtasks.ErrExpired):
+		fmt.Println(rose.Render("✿ ") + text.Render("your Google sign-in expired — run ") + rose.Render("gtask auth"))
 	case errors.Is(err, gtasks.ErrNoToken):
 		fmt.Println(rose.Render("✿ ") + text.Render("not signed in yet — run ") + rose.Render("gtask auth"))
 	default:

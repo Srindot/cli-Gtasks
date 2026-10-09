@@ -1,4 +1,4 @@
-module github.com/srindot/gtask
+module github.com/Srindot/cli-Gtasks
 
 go 1.26.0
 

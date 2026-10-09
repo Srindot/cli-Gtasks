@@ -1,1 +1,35 @@
-gtask
+# Build output
+/gtask
+/gtask.exe
+/dist/
+/bin/
+*.test
+*.out
+coverage.*
+*.prof
+
+# Google OAuth secrets: never commit these.
+# (gtask keeps them in ~/.config/gtask, but guard against copies landing here.)
+credentials.json
+token.json
+client_secret_*.json
+*.apps.googleusercontent.com.json
+
+# Local state
+cache.json
+crash.log
+.env
+.env.*
+
+# Go workspace
+go.work
+go.work.sum
+/vendor/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store

@@ -10,7 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/muesli/termenv"
 
-	"github.com/srindot/gtask/internal/gtasks"
+	"github.com/Srindot/cli-Gtasks/internal/gtasks"
 )
 
 type row struct {
@@ -319,39 +319,109 @@ func (m *Model) placement(above bool) (parent, previous string) {
 }
 
 func (m *Model) startNew(parent, previous string) {
-	m.ed = edit{kind: editNew, listID: m.curID(), parent: parent, previous: previous}
-	m.mode = modeInsert
-	m.in.SetValue("")
-	m.in.Placeholder = "new task  ·  end with @tomorrow to set a due date"
-	m.in.Focus()
+	m.ed = edit{kind: editNew, listID: m.curID(), parent: parent, previous: previous, more: true, at: time.Now()}
+	m.beginInput("", "new task  ·  end with @tom for a due date")
+	m.cursorToDraft()
+}
+
+// compose opens the "a" (task) / "A" (subtask) card right where the task
+// will land; tab moves it between the two spots.
+func (m *Model) compose(sub bool) {
+	if m.curList() == nil {
+		return
+	}
+	anchor := m.selected()
+	ed := edit{kind: editNew, listID: m.curID(), at: time.Now(), back: m.focus}
+	if m.focus == paneDetails {
+		sub = true
+	}
+	if anchor != nil {
+		ed.anchor = anchor.ID
+		ed.canSub = !anchor.Done() && !m.rootOf(anchor).Done()
+	}
+	ed.sub = sub && ed.canSub
+	m.ed = ed
+	m.placeDraft()
+	m.setFocus(paneTasks)
+	m.beginInput("", "what needs doing?")
+	m.cursorToDraft()
+}
+
+func (m *Model) placeDraft() {
+	if a := m.find(m.ed.listID, m.ed.anchor); a != nil {
+		m.ed.parent, m.ed.previous = m.newPlacement(a, m.ed.sub)
+	}
+}
+
+// flipDraft toggles the composer between task and subtask, gliding the card.
+func (m *Model) flipDraft() {
+	if !m.ed.canSub {
+		return
+	}
+	m.ed.from, m.ed.fromAt, m.ed.fromDepth = m.draftColor(), time.Now(), m.draftDepth()
+	m.ed.sub = !m.ed.sub
+	m.placeDraft()
+	m.cursorToDraft()
+}
+
+func (m *Model) draftColor() string {
+	switch {
+	case m.ed.kind == editRename:
+		return cFoam
+	case m.ed.sub:
+		return cIris
+	}
+	return cRose
+}
+
+func (m *Model) draftDepth() int {
+	for _, r := range m.rows() {
+		if r.editNew {
+			return r.depth
+		}
+	}
+	return 0
+}
+
+func (m *Model) cursorToDraft() {
 	for i, r := range m.rows() {
 		if r.editNew {
 			m.cursor = i
-			m.sizeInput(r.depth)
 		}
 	}
 }
 
-func (m *Model) startRename(t *gtasks.Task, value string, atStart bool) {
-	m.ed = edit{kind: editRename, listID: m.curID(), taskID: t.ID}
+func (m *Model) beginInput(value, placeholder string) {
 	m.mode = modeInsert
-	m.in.Placeholder = ""
+	m.in.Placeholder = placeholder
 	m.in.SetValue(value)
+	m.in.Width = 1 << 12 // inputView does the scrolling
 	m.in.Focus()
-	m.sizeInput(m.depth(m.curID(), t))
+	m.in.CursorEnd()
+	m.typedAt, m.hintKey, m.hintAt = time.Time{}, "", time.Now()
+}
+
+func (m *Model) startRename(t *gtasks.Task, value string, atStart bool) {
+	m.ed = edit{kind: editRename, listID: m.curID(), taskID: t.ID, at: time.Now()}
+	m.beginInput(value, "new title")
 	if atStart {
 		m.in.CursorStart()
-	} else {
-		m.in.CursorEnd()
+	}
+}
+
+// restoreDraftCursor puts the cursor back where it was before composing.
+func (m *Model) restoreDraftCursor(ed edit) {
+	switch {
+	case ed.anchor != "":
+		m.selectID(ed.anchor)
+	case ed.previous != "":
+		m.selectID(ed.previous)
+	default:
+		m.setCursor(m.cursor)
 	}
 }
 
 // commitEdit finishes insert mode; more=true keeps typing new tasks (Enter).
-func (m *Model) sizeInput(depth int) {
-	_, tw, _ := m.layout()
-	m.in.Width = max(tw-4-4-2*depth-1, 8)
-}
-
 func (m *Model) commitEdit(more bool) tea.Cmd {
 	ed, val := m.ed, strings.TrimSpace(m.in.Value())
 	m.ed, m.mode = edit{}, modeNormal
@@ -359,15 +429,24 @@ func (m *Model) commitEdit(more bool) tea.Cmd {
 	switch ed.kind {
 	case editNew:
 		if val == "" {
-			m.setCursor(m.cursor)
-			if p := ed.previous; p != "" {
-				m.selectID(p)
-			}
+			m.restoreDraftCursor(ed)
 			return nil
 		}
 		t := m.addTask(ed.listID, val, ed.parent, ed.previous)
-		if more {
+		switch {
+		case more && ed.more:
 			m.startNew(t.Parent, t.ID)
+		case ed.sub:
+			m.say(cIris, "%s added under %s", t.Title, m.rootOf(t).Title)
+		default:
+			m.say(cRose, "%s added", t.Title)
+		}
+		if !ed.more && ed.back == paneDetails {
+			m.setFocus(paneDetails)
+			if p := m.rootOf(t); p != nil && p != t {
+				m.selectID(p.ID)
+				m.dfield = fSubs + len(m.children(ed.listID, p.ID)) - 1
+			}
 		}
 	case editRename:
 		return m.rename(ed.listID, ed.taskID, val)
@@ -452,12 +531,17 @@ func (m *Model) rootOf(t *gtasks.Task) *gtasks.Task {
 }
 
 func (m *Model) cancelEdit() {
-	if m.ed.kind == editNew && m.ed.previous != "" {
-		defer m.selectID(m.ed.previous)
-	}
+	ed := m.ed
 	m.ed, m.mode = edit{}, modeNormal
 	m.in.Blur()
-	m.setCursor(m.cursor)
+	if ed.kind == editNew {
+		m.restoreDraftCursor(ed)
+		if ed.back == paneDetails {
+			m.setFocus(paneDetails)
+		}
+	} else {
+		m.setCursor(m.cursor)
+	}
 }
 
 // patchLocal sets a string field locally and on the server; "" clears it.
@@ -761,8 +845,9 @@ func (m *Model) startNotes(t *gtasks.Task) {
 	m.mode, m.focus, m.dfield = modeNotes, paneDetails, fNotes
 	m.ta.SetValue(t.Notes)
 	m.ta.Focus()
-	m.ta.SetWidth(max(m.paneWidth(paneDetails)-4, 10))
-	m.ta.SetHeight(max(m.bodyHeight()-8, 3))
+	m.ta.SetWidth(max(cardWidth(m.paneWidth(paneDetails))-4, 10))
+	m.ta.SetHeight(max(m.bodyHeight()-12, 3))
+	m.notesAt = time.Now() // the notes card traces in
 }
 
 func (m *Model) commitNotes(save bool) tea.Cmd {

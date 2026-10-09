@@ -77,7 +77,7 @@ func (m *Model) animating() bool {
 	now := time.Now()
 	return len(m.anims) > 0 || len(m.trail) > 0 || m.toast != nil ||
 		now.Sub(m.focusAt) < focusLife || now.Sub(m.listAt) < focusLife || len(m.lists) == 0 || now.Sub(m.started) < introLife ||
-		m.pending+m.fetching > 0
+		m.pending+m.fetching > 0 || (m.mode != modeNormal && m.mode != modeHelp) // the caret breathes
 }
 
 func sprintf(format string, a ...any) string {

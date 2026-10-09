@@ -8,8 +8,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
-	"github.com/srindot/gtask/internal/gtasks"
+	"github.com/Srindot/cli-Gtasks/internal/gtasks"
 )
 
 // The Cloud console is a maze; these links land directly on the page each step needs.
@@ -20,32 +21,30 @@ type setupStep struct {
 
 var setupSteps = []setupStep{
 	{"Create a project", "https://console.cloud.google.com/projectcreate", []string{
-		"Project name: type " + "gtask" + " (anything works)",
-		"leave Location as it is → click Create",
-		"wait ~10 seconds until the notification says it's done",
+		"Project name: gtask (anything works)",
+		"leave Organization / Location as they are → Create",
+		"wait until the bell (top-right) says the project is ready",
 	}},
 	{"Turn on the Tasks API", "https://console.cloud.google.com/apis/library/tasks.googleapis.com", []string{
-		"check the project picker at the top-left says gtask (switch to it if not)",
-		"click the blue Enable button",
+		"the project picker (top-left) must say gtask — click it and pick gtask if not",
+		"click Enable",
 	}},
 	{"Set up the sign-in screen", "https://console.cloud.google.com/auth/overview", []string{
 		"click Get started",
-		"App information: name gtask, support email = you → Next",
+		"App name: gtask · User support email: pick yours → Next",
 		"Audience: External → Next",
 		"Contact information: your email → Next",
-		"tick the agreement → Continue → Create",
+		"tick “I agree…” → Continue → Create",
 	}},
-	{"Let yourself sign in", "https://console.cloud.google.com/auth/audience", []string{
-		"under Publishing status click Publish app → Confirm",
-		"if it says to complete Branding: open https://console.cloud.google.com/auth/branding,",
-		"  fill App name, User support email and Developer contact email → Save, then publish",
-		"or instead: Test users → + Add users → your Gmail → Save",
-		"  (works too, but Google signs you out every 7 days)",
+	{"Add yourself as a test user", "https://console.cloud.google.com/auth/audience", []string{
+		"leave Publishing status on Testing (no need to press Publish)",
+		"scroll to Test users → + Add users → your Gmail address → Save",
+		"Testing apps ask you to sign in again about once a week — gtask reopens the browser for you",
 	}},
-	{"Create the key gtask uses", "https://console.cloud.google.com/auth/clients/create", []string{
-		"Application type: Desktop app",
-		"name: anything → click Create",
-		"a box appears with a Client ID and Client secret — keep it open",
+	{"Create the key", "https://console.cloud.google.com/auth/clients/create", []string{
+		"Application type: Desktop app   (not Web application)",
+		"Name: anything → Create",
+		"in the “OAuth client created” box click Download JSON → OK",
 	}},
 }
 
@@ -87,11 +86,7 @@ func setup() error {
 	if f := findDownloadedClient(); f != "" {
 		fmt.Println(text.Render("  found a downloaded key: ") + gold.Render(f))
 		if a.yes(text.Render("  use it?")) {
-			b, err := os.ReadFile(f)
-			if err != nil {
-				return err
-			}
-			if err := saveCredentials(b); err != nil {
+			if err := importKey(f); err != nil {
 				return err
 			}
 			return login()
@@ -103,6 +98,7 @@ func setup() error {
 	fmt.Println(subtle.Render("  do what's listed, come back here, press Enter."))
 	fmt.Println(muted.Render("  (already have a Client ID? type ") + rose.Render("k") + muted.Render(" at any step to jump to the end)"))
 
+	began := time.Now()
 	for i, s := range setupSteps {
 		fmt.Println()
 		fmt.Println(iris.Bold(true).Render(fmt.Sprintf("  %d/%d  ", i+1, len(setupSteps))) + text.Bold(true).Render(s.title))
@@ -116,23 +112,55 @@ func setup() error {
 		case "s":
 			continue
 		}
-		openBrowser(s.url)
 		for _, d := range s.do {
 			fmt.Println(pine.Render("       › ") + text.Render(d))
 		}
+		openBrowser(s.url)
 		if ans := strings.ToLower(a.line(muted.Render("       done? Enter to continue  "))); ans == "q" {
 			os.Exit(0)
+		}
+	}
+	// Step 5 ends with a download; pick it up instead of asking.
+	if f := findDownloadedClient(); f != "" && modTime(f) > began.UnixNano() {
+		fmt.Println()
+		fmt.Println(pine.Render("  ✓ ") + text.Render("got the key you just downloaded: ") + gold.Render(filepath.Base(f)))
+		if err := importKey(f); err == nil {
+			return login()
+		} else {
+			fmt.Println(love.Render("  ✗ ") + text.Render(err.Error()))
 		}
 	}
 	return askKey(a)
 }
 
+func importKey(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return saveCredentials(b)
+}
+
 func askKey(a asker) error {
 	fmt.Println()
 	fmt.Println(iris.Bold(true).Render("  ✓  ") + text.Bold(true).Render("Paste the key here"))
-	fmt.Println(muted.Render("       copy the values from that box (or paste the path of the downloaded .json)"))
+	fmt.Println(muted.Render("       downloaded the JSON? just press Enter and gtask finds it in ~/Downloads"))
+	fmt.Println(muted.Render("       otherwise paste the Client ID, or the path to the .json file"))
 	for {
 		id := a.line(text.Render("       Client ID      ") + muted.Render("› "))
+		if id == "" {
+			f := findDownloadedClient()
+			if f == "" {
+				fmt.Println(love.Render("       ✗ ") + text.Render("no client_secret_*.json in ~/Downloads yet"))
+				continue
+			}
+			fmt.Println(pine.Render("       ✓ ") + text.Render("found ") + gold.Render(filepath.Base(f)))
+			if err := importKey(f); err != nil {
+				fmt.Println(love.Render("       ✗ ") + text.Render(err.Error()))
+				continue
+			}
+			return login()
+		}
 		if strings.HasSuffix(strings.ToLower(id), ".json") {
 			b, err := os.ReadFile(expandHome(strings.Trim(id, `'"`)))
 			if err != nil {

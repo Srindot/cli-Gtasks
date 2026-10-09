@@ -7,7 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/srindot/gtask/internal/gtasks"
+	"github.com/Srindot/cli-Gtasks/internal/gtasks"
 )
 
 // testHook lets tests read the view from inside the event loop.
@@ -143,11 +143,15 @@ func (m *Model) clamp() {
 	h := m.bodyHeight()
 	so := min(3, max(0, (h-1)/2))
 	line := m.lineOf(m.cursor)
+	end := line
+	if rs := m.rows(); m.cursor < len(rs) {
+		end += m.span(rs[m.cursor]) - 1
+	}
+	if end > m.offset+h-1-so {
+		m.offset = end - h + 1 + so
+	}
 	if line < m.offset+so {
 		m.offset = line - so
-	}
-	if line > m.offset+h-1-so {
-		m.offset = line - h + 1 + so
 	}
 	if total := m.lineCount(); m.offset > total-h {
 		m.offset = total - h
@@ -197,9 +201,7 @@ func (m *Model) key(k tea.KeyMsg) tea.Cmd {
 			}
 			return nil
 		}
-		var c tea.Cmd
-		m.in, c = m.in.Update(k)
-		return c
+		return m.feed(k)
 	case modeNotes:
 		switch s {
 		case "esc":
@@ -211,18 +213,26 @@ func (m *Model) key(k tea.KeyMsg) tea.Cmd {
 		m.ta, c = m.ta.Update(k)
 		return c
 	case modeInsert:
+		composer := m.ed.kind == editNew && !m.ed.more
 		switch s {
 		case "esc":
+			if composer {
+				m.cancelEdit()
+				return nil
+			}
 			return m.commitEdit(false)
 		case "enter":
 			return m.commitEdit(m.ed.kind == editNew)
 		case "ctrl+c":
 			m.cancelEdit()
 			return nil
+		case "tab", "shift+tab":
+			if composer {
+				m.flipDraft()
+			}
+			return nil
 		}
-		var c tea.Cmd
-		m.in, c = m.in.Update(k)
-		return c
+		return m.feed(k)
 	case modeCommand, modeSearch:
 		return m.lineKey(k)
 	}
@@ -267,8 +277,7 @@ func (m *Model) lineKey(k tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 	}
-	var c tea.Cmd
-	m.in, c = m.in.Update(k)
+	c := m.feed(k)
 	if md == modeSearch {
 		m.filter = m.in.Value()
 		m.cursor, m.offset = 0, 0
@@ -589,9 +598,9 @@ func (m *Model) tasksKey(s string, n int, hadCount bool) tea.Cmd {
 			m.dfield = fTitle
 		}
 	case "a":
-		m.newTaskPopup(false)
+		m.compose(false)
 	case "A":
-		m.newTaskPopup(true)
+		m.compose(true)
 	case "o", "O":
 		if m.curList() == nil {
 			return nil
@@ -604,7 +613,7 @@ func (m *Model) tasksKey(s string, n int, hadCount bool) tea.Cmd {
 		}
 	case "r":
 		if t != nil {
-			m.renamePopup(t)
+			m.startRename(t, t.Title, false)
 		}
 	case "i", "I":
 		if t != nil {
@@ -698,7 +707,7 @@ func (m *Model) detailsKey(s string, n int) tea.Cmd {
 	case "x", " ", "space":
 		return m.toggle(tg.t)
 	case "a", "A", "o", "O":
-		m.newTaskPopup(true)
+		m.compose(true)
 	case "r":
 		m.renamePopup(tg.t)
 	case "t":

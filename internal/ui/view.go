@@ -107,19 +107,67 @@ func (m *Model) sepIndex(rs []row) int {
 	return -1
 }
 
+// lineOf is the line row i starts on; cards take more than one line.
 func (m *Model) lineOf(i int) int {
-	if s := m.sepIndex(m.rows()); s >= 0 && i >= s {
-		return i + 1
+	rs := m.rows()
+	n := 0
+	for j := 0; j < i && j < len(rs); j++ {
+		n += m.span(rs[j])
 	}
-	return i
+	if s := m.sepIndex(rs); s >= 0 && i >= s {
+		n++
+	}
+	return n
 }
 
-func (m *Model) lineCount() int {
-	rs := m.rows()
-	if m.sepIndex(rs) >= 0 {
-		return len(rs) + 1
+func (m *Model) lineCount() int { return m.lineOf(len(m.rows())) }
+
+func (m *Model) span(r row) int {
+	if m.isCard(r) {
+		return 3
 	}
-	return len(rs)
+	return 1
+}
+
+// isCard reports whether a row is being typed into (and so drawn as a card).
+func (m *Model) isCard(r row) bool {
+	return r.editNew || (m.mode == modeInsert && m.ed.kind == editRename && r.t != nil && r.t.ID == m.ed.taskID)
+}
+
+// taskCard draws the input card for a new task or a rename, in place in the list.
+func (m *Model) taskCard(r row, w int, now time.Time) []string {
+	color, depth := m.draftColor(), float64(r.depth)
+	if m.ed.from != "" {
+		color = glide(m.ed.from, color, m.ed.fromAt, now)
+		g := easeOut(float64(now.Sub(m.ed.fromAt)) / float64(glideLife))
+		depth = float64(m.ed.fromDepth) + (depth-float64(m.ed.fromDepth))*g
+	}
+	indent := 1 + int(depth*3+.5)
+	cw := w - indent - 1
+	var title []seg
+	check := ic.open
+	switch {
+	case m.ed.kind == editRename:
+		title = segs(seg{ic.edit + " rename", color})
+		if r.t != nil && r.t.Done() {
+			check = ic.done
+		}
+	case m.ed.sub:
+		under := ""
+		if p := m.find(m.ed.listID, m.ed.parent); p != nil {
+			under = " of " + p.Title
+		}
+		title = segs(seg{ic.sub + " new subtask" + under, color})
+	default:
+		title = segs(seg{ic.add + " new task", color})
+	}
+	body := paint(color, check+" ") + m.inputView(cw-6, true, m.in.Placeholder, now)
+	out := frame(cw, color, title, m.chip(m.cardHint(), now), []string{body}, m.ed.at, now)
+	pad := strings.Repeat(" ", indent)
+	for i := range out {
+		out[i] = fit(pad+out[i], w)
+	}
+	return out
 }
 
 // selBg is the highlight behind the hovered row; it brightens as a pane gains focus.
@@ -273,7 +321,7 @@ func (m *Model) colLists(w, h int, now time.Time) []string {
 	}
 	lines = lines[:h]
 	if m.pop != nil && m.pop.pane == paneLists {
-		m.overlayPopup(lines, w, m.listIdx+1, now)
+		lines = splice(lines, m.listIdx+1, m.popupCard(cardWidth(w), now), w, h)
 	}
 	return lines
 }
@@ -288,6 +336,10 @@ func (m *Model) colTasks(w, h int, now time.Time) []string {
 		if i == sep {
 			label := fmt.Sprintf(" %s completed · %d ", ic.done, len(rs)-sep)
 			all = append(all, " "+paint(cHlMed, "─")+paint(cMuted, label)+paint(cHlMed, strings.Repeat("─", max(w-2-lipgloss.Width(label), 0))))
+		}
+		if m.isCard(r) {
+			all = append(all, m.taskCard(r, w, now)...)
+			continue
 		}
 		all = append(all, m.taskRow(r, i == m.cursor, w, now))
 	}
@@ -311,7 +363,8 @@ func (m *Model) colTasks(w, h int, now time.Time) []string {
 		}
 	}
 	if m.pop != nil && m.pop.pane == paneTasks {
-		m.overlayPopup(lines, w, m.lineOf(m.cursor)-m.offset+1, now)
+		y := m.lineOf(m.cursor) - m.offset + 1
+		lines = splice(lines, y, m.popupCard(cardWidth(w), now), w, h)
 	}
 	return lines
 }
@@ -542,11 +595,11 @@ func (m *Model) colDetails(w, h int, now time.Time) []string {
 	}
 	label := func(l *line, icon, k string) { l.put(icon+" ", fg(cMuted)); l.put(fmt.Sprintf("%-8s", k), fg(cMuted)) }
 
-	if t == nil {
+	if t == nil && m.mode == modeInsert && m.ed.kind == editNew {
+		lines = append(lines, m.draftDetails(w, now)...)
+	} else if t == nil {
 		blank()
-		for _, l := range []string{paint(cMuted, "nothing selected")} {
-			lines = append(lines, "  "+l)
-		}
+		lines = append(lines, "  "+paint(cMuted, "nothing selected"))
 	} else {
 		blank()
 		if r := m.rootOf(t); r != t {
@@ -599,14 +652,17 @@ func (m *Model) colDetails(w, h int, now time.Time) []string {
 
 		// Notes
 		heading(ic.notes+" notes", "")
-		if m.mode == modeNotes {
-			for _, s := range strings.Split(m.ta.View(), "\n") {
-				lines = append(lines, "  "+fit(s, w-2))
+		switch {
+		case m.mode == modeNotes:
+			hint := segs(seg{"esc", cSubtle}, seg{" save  ", cMuted}, seg{"^c", cSubtle}, seg{" cancel", cMuted})
+			card := frame(cardWidth(w), cIris, segs(seg{"editing", cIris}), hint,
+				strings.Split(m.ta.View(), "\n"), m.notesAt, now)
+			for _, c := range card {
+				lines = append(lines, " "+c)
 			}
-			lines = append(lines, "  "+paint(cMuted, "esc save · ^c cancel"))
-		} else if t.Notes == "" {
+		case t.Notes == "":
 			field(fNotes, func(l *line) { l.put("empty — ⏎ to write", fg(cHlHigh)) })
-		} else {
+		default:
 			var nl []func(l *line)
 			for _, s := range wrap(t.Notes, inner) {
 				s := s
@@ -664,9 +720,63 @@ func (m *Model) colDetails(w, h int, now time.Time) []string {
 	}
 	lines = lines[:h]
 	if m.pop != nil && m.pop.pane == paneDetails {
-		m.overlayPopup(lines, w, popupAt, now)
+		lines = splice(lines, popupAt, m.popupCard(cardWidth(w), now), w, h)
 	}
 	return lines
+}
+
+// draftDetails previews the task being typed: title, due date and where it lands.
+func (m *Model) draftDetails(w int, now time.Time) []string {
+	title, due, hasDue := SplitQuickDue(m.in.Value())
+	color := m.draftColor()
+	if m.ed.from != "" {
+		color = glide(m.ed.from, color, m.ed.fromAt, now)
+	}
+	inner := w - 4
+	var out []string
+	add := func(f func(l *line)) { out = append(out, (&line{}).doneWith(w, f)) }
+	out = append(out, "")
+	kind := "new task"
+	if m.ed.sub {
+		kind = "new subtask"
+	}
+	add(func(l *line) { l.put("  "+ic.add+" ", fg(color)); l.put(kind, fg(color).Bold(true)) })
+	out = append(out, "")
+	if strings.TrimSpace(title) == "" {
+		add(func(l *line) { l.put("  untitled", fg(cHlHigh).Italic(true)) })
+	} else {
+		for _, s := range wrap(title, inner) {
+			s := s
+			add(func(l *line) { l.put("  "+s, fg(cText).Bold(true)) })
+		}
+	}
+	out = append(out, "")
+	label := func(l *line, icon, k string) {
+		l.put("  "+icon+" ", fg(cMuted))
+		l.put(fmt.Sprintf("%-8s", k), fg(cMuted))
+	}
+	add(func(l *line) {
+		label(l, ic.due, "due")
+		if hasDue {
+			_, c := HumanDue(due)
+			l.put(due.Format("Mon, Jan 2"), m.chipStyle(c, now))
+			l.put("  "+relDays(due), fg(cMuted))
+		} else {
+			l.put("none", fg(cHlHigh))
+		}
+	})
+	if lst := m.curList(); lst != nil {
+		add(func(l *line) { label(l, ic.list, "list"); l.put(ansiTrunc(lst.Title, inner-11), fg(cSubtle)) })
+	}
+	if p := m.find(m.ed.listID, m.ed.parent); p != nil {
+		add(func(l *line) { label(l, ic.sub, "under"); l.put(ansiTrunc(p.Title, inner-11), fg(cIris)) })
+	}
+	return out
+}
+
+// chipStyle fades a value in alongside the card's hint chip.
+func (m *Model) chipStyle(c string, now time.Time) lipgloss.Style {
+	return fg(lerp(cHlMed, c, easeOut(float64(now.Sub(m.hintAt))/float64(chipLife))))
 }
 
 func (l *line) doneWith(w int, f func(l *line)) string { f(l); return l.done(w) }
@@ -747,17 +857,22 @@ func (m *Model) showcmd() string {
 func (m *Model) cmdLine(now time.Time) string {
 	switch m.mode {
 	case modeCommand:
-		return paint(cGold, ":") + m.in.View()
+		return paint(cGold, ":") + m.inputView(m.w-2, false, "", now)
 	case modeSearch:
-		return paint(cRose, "/") + m.in.View()
+		return paint(cRose, "/") + m.inputView(m.w-2, false, "", now)
 	case modeInsert:
-		return fg(cFoam).Bold(true).Render("-- INSERT --") + paint(cMuted, "   ⏎ save & next   esc save   ^c cancel")
-	case modePopup:
-		hint := "⏎ confirm   esc cancel"
-		if m.pop != nil && m.pop.tab != nil {
-			hint += "   tab task ⇄ subtask"
+		hint := "   ⏎ save & next   esc done   ^c cancel"
+		switch {
+		case m.ed.kind == editRename:
+			hint = "   ⏎ save   esc save   ^c cancel"
+		case !m.ed.more && m.ed.canSub:
+			hint = "   ⏎ add   esc cancel   tab task ⇄ subtask"
+		case !m.ed.more:
+			hint = "   ⏎ add   esc cancel"
 		}
-		return paint(cMuted, hint)
+		return fg(cFoam).Bold(true).Render("-- INSERT --") + paint(cMuted, hint)
+	case modePopup:
+		return paint(cMuted, "⏎ confirm   esc cancel")
 	}
 	if m.quit {
 		return spin(now) + paint(cGold, fmt.Sprintf(" waiting for %d change%s to reach Google… ", m.pending, plural(m.pending))) + paint(cMuted, "(q again to force)")
@@ -815,7 +930,7 @@ func (m *Model) help() string {
 		keys        []kv
 	}{
 		{"move", cFoam, []kv{{"j k", "down / up (5j works)"}, {"gg G", "top / bottom"}, {"^d ^u", "half page"}, {"h l", "lists ← tasks → details"}, {"tab", "cycle panes"}, {"H L  gT gt", "prev / next list"}}},
-		{"create", cRose, []kv{{"a", "new task"}, {"A", "new subtask"}, {"tab", "(in popup) task ⇄ subtask"}, {"o O", "inline below / above, ⏎ keeps going"}, {"…@tom", "due date while typing"}}},
+		{"create", cRose, []kv{{"a", "new task"}, {"A", "new subtask"}, {"tab", "(while typing) task ⇄ subtask"}, {"o O", "inline below / above, ⏎ keeps going"}, {"…@tom", "due date while typing"}}},
 		{"edit", cIris, []kv{{"x ␣", "toggle done"}, {"r  i  S", "rename / inline / replace"}, {"t T", "set / clear due date"}, {"N", "edit notes inline"}, {"e", "title + notes in $EDITOR"}, {"l ⏎", "details: edit any field"}}},
 		{"organize", cGold, []kv{{"dd D", "delete"}, {"yy p P", "yank / paste (moves across lists)"}, {"J K", "move down / up"}, {">> <<", "make / unmake subtask"}, {"za zR zM", "fold"}, {"u", "undo"}}},
 		{"lists", cPine, []kv{{"a r dd", "new / rename / delete (lists pane)"}, {"/  esc", "filter / clear"}, {"C  R", "show completed / sync"}, {":q", "quit"}}},

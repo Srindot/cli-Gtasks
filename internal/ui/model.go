@@ -16,7 +16,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/srindot/gtask/internal/gtasks"
+	"github.com/Srindot/cli-Gtasks/internal/gtasks"
 )
 
 type mode int
@@ -61,6 +61,15 @@ type edit struct {
 	kind             editKind
 	listID, taskID   string // rename
 	parent, previous string // new
+	at               time.Time
+
+	// The "a"/"A" composer (more=false) vs. "o"/"O" typing in a row (more=true).
+	more, sub, canSub bool
+	anchor            string
+	back              pane // pane to return to after composing from details
+	from              string
+	fromAt            time.Time
+	fromDepth         int
 }
 
 type undoEntry struct {
@@ -195,6 +204,11 @@ type Model struct {
 	filter   string
 	undo     []undoEntry
 	reg      []gtasks.Task // yank register: root first, then descendants
+
+	typedAt time.Time // last character typed into m.in
+	hintKey string    // card hint text, to fade the chip in when it changes
+	hintAt  time.Time
+	notesAt time.Time
 
 	anims   map[string]*anim
 	trail   map[string]time.Time

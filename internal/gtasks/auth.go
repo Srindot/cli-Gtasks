@@ -22,6 +22,7 @@ const Scope = "https://www.googleapis.com/auth/tasks"
 var (
 	ErrNoCredentials = errors.New("no OAuth client credentials found")
 	ErrNoToken       = errors.New("not logged in")
+	ErrExpired       = errors.New("Google sign-in expired")
 )
 
 var googleEndpoint = oauth2.Endpoint{
@@ -177,5 +178,14 @@ func HTTPClient(ctx context.Context, dir string) (*http.Client, error) {
 	}
 	ctx = context.WithValue(ctx, oauth2.HTTPClient, &http.Client{Timeout: 20 * time.Second})
 	src := &savingSource{src: cfg.TokenSource(ctx, &tok), dir: dir, last: tok.AccessToken}
+	// Refresh up front so a revoked or expired sign-in (apps left in "Testing"
+	// lose it weekly) is caught here rather than as errors inside the UI.
+	// Network trouble is ignored: the UI works offline from its cache.
+	if !tok.Valid() {
+		var re *oauth2.RetrieveError
+		if _, err := src.Token(); errors.As(err, &re) && re.ErrorCode == "invalid_grant" {
+			return nil, ErrExpired
+		}
+	}
 	return oauth2.NewClient(ctx, oauth2.ReuseTokenSource(&tok, src)), nil
 }

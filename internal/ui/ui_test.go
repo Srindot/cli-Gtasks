@@ -10,7 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/srindot/gtask/internal/gtasks"
+	"github.com/Srindot/cli-Gtasks/internal/gtasks"
 )
 
 type harness struct {
@@ -321,5 +321,30 @@ func TestCreateAndDetails(t *testing.T) {
 	ts, _ = h.d.Tasks(t0(), "inbox")
 	if !ts[2].Done() {
 		t.Fatalf("subtask not toggled from details: %+v", ts[2])
+	}
+}
+
+// The input card opens where the task will land and pushes rows down instead
+// of covering them; esc leaves the list untouched.
+func TestCardPushesRows(t *testing.T) {
+	h := start(t, 120, 30)
+	before := h.serverTitles("inbox")
+	for _, k := range []string{"a", "A", "t"} {
+		h.keys("g", "g", "j", k)
+		h.settle()
+		v := h.view("card " + k)
+		for _, title := range []string{"Water the plants", "Plan weekend trip", "Book train tickets", "Call mom", "Renew passport", "Try the new ramen place"} {
+			if !strings.Contains(v, title) {
+				t.Errorf("%s: card hid %q:\n%s", k, title, v)
+			}
+		}
+		if !strings.Contains(v, "╭─") || !strings.Contains(v, "╯") {
+			t.Errorf("%s: no card drawn:\n%s", k, v)
+		}
+		h.keys("esc")
+	}
+	h.settle()
+	if got := h.serverTitles("inbox"); strings.Join(got, "|") != strings.Join(before, "|") {
+		t.Fatalf("esc changed tasks: %v -> %v", before, got)
 	}
 }
